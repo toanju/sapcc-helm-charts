@@ -1,0 +1,198 @@
+{{- if ((.Values).ovn).enabled | default false }}
+# ovnkube-node
+# daemonset version 3
+# starts node daemons for ovn, each in a separate container
+# it is run on all nodes
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: ovnkube-node
+  # namespace set up by install
+  namespace: ovn-kubernetes
+  annotations:
+    kubernetes.io/description: |
+      This DaemonSet launches the ovn-kubernetes networking components for worker nodes.
+spec:
+  selector:
+    matchLabels:
+      app: ovnkube-node
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: ovnkube-node
+        name: ovnkube-node
+        component: network
+        type: infra
+        kubernetes.io/os: "linux"
+    spec:
+      imagePullSecrets:
+        - name: registry-credentials
+      priorityClassName: "system-cluster-critical"
+      serviceAccountName: ovnkube-node
+      hostNetwork: true
+      dnsPolicy: Default
+      # access host ovs
+      hostPID: true
+      initContainers:
+      - name: init-ovsdb-config
+        image: {{ required ".Values.global.ghcrIoMirror is missing" $.Values.global.ghcrIoMirror }}/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:{{ $.Values.ovn.imageVersionOVN | required "Please set neutron.imageVersionOVN or similar" }}
+        imagePullPolicy: "IfNotPresent"
+        command: ["/bin/bash", "-c", "ovs-vsctl set Open_vSwitch . external_ids:ovn-remote=\"tcp:{{ $.Values.ovn.sbAddress }}:{{ $.Values.ovn.sbPort }}\" external_ids:system-id=\"$(hostname)\""]
+        volumeMounts:
+        - mountPath: /var/run/openvswitch/
+          name: host-var-run-ovs
+        - mountPath: /etc/ovn/
+          name: host-ovn-cert
+          readOnly: true
+        securityContext:
+          runAsUser: 0
+      containers:
+      - name: ovn-controller
+        image: {{ required ".Values.global.ghcrIoMirror is missing" $.Values.global.ghcrIoMirror }}/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:{{ $.Values.ovn.imageVersionOVN | required "Please set neutron.imageVersionOVN or similar" }}
+        imagePullPolicy: "IfNotPresent"
+        command: ["/root/ovnkube.sh", "ovn-controller"]
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add: ["SYS_NICE"]
+        terminationMessagePolicy: FallbackToLogsOnError
+        volumeMounts:
+        - mountPath: /var/run/dbus/
+          name: host-var-run-dbus
+          readOnly: true
+        - mountPath: /var/log/openvswitch/
+          name: host-var-log-ovs
+        - mountPath: /var/log/ovn/
+          name: host-var-log-ovs
+        - mountPath: /var/run/openvswitch/
+          name: host-var-run-ovs
+        - mountPath: /var/run/ovn/
+          name: host-var-run-ovs
+        - mountPath: /ovn-cert
+          name: host-ovn-cert
+          readOnly: true
+        resources: {{ toYaml $.Values.ovn.resources | nindent 10 }}
+
+        env:
+        - name: OVN_DAEMONSET_VERSION
+          value: "1.0.0"
+        - name: OVN_NORTH
+          value: "XXX"
+        - name: OVN_SOUTH
+          value: "XXX"
+        - name: OVN_LOGLEVEL_CONTROLLER
+          value: {{ default "-vconsole:info" .Values.ovn.controllerLogLevel | quote }}
+        - name: K8S_APISERVER
+          valueFrom:
+            configMapKeyRef:
+              name: ovn-config
+              key: k8s_apiserver
+        - name: K8S_NODE
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: OVN_KUBERNETES_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OVN_SSL_ENABLE
+          value: {{ default "" .Values.ovn.enableSsl | quote }}
+        readinessProbe:
+          exec:
+            command: ["/usr/bin/ovn-kube-util", "readiness-probe", "-t", "ovn-controller"]
+          initialDelaySeconds: 30
+          timeoutSeconds: 30
+          periodSeconds: 60
+        # ovs-metrics-exporter - v3
+      - name: ovs-metrics-exporter
+        image: {{ required ".Values.global.ghcrIoMirror is missing" $.Values.global.ghcrIoMirror }}/ovn-org/ovn-kubernetes/ovn-kube-ubuntu:{{ $.Values.ovn.imageVersionOVN | required "Please set neutron.imageVersionOVN or similar" }}
+        imagePullPolicy: "IfNotPresent"
+        command: ["/root/ovnkube.sh", "ovs-metrics"]
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add: ["NET_ADMIN"]
+        terminationMessagePolicy: FallbackToLogsOnError
+        volumeMounts:
+        - mountPath: /var/run/dbus/
+          name: host-var-run-dbus
+          readOnly: true
+        - mountPath: /var/log/openvswitch/
+          name: host-var-log-ovs
+        - mountPath: /var/run/openvswitch/
+          name: host-var-run-ovs
+          readOnly: true
+        resources: {{ toYaml $.Values.ovn.resources | nindent 10 }}
+        env:
+        - name: OVN_DAEMONSET_VERSION
+          value: "1.0.0"
+        - name: K8S_NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        # end of container
+      nodeSelector:
+        neutron.openstack.cloud.sap/ml2-mechanism-driver: ovn
+      #affinity:
+      #  nodeAffinity:
+      #    requiredDuringSchedulingIgnoredDuringExecution:
+      #      nodeSelectorTerms:
+      #      - matchExpressions:
+      #        - key: k8s.ovn.org/dpu-host
+      #          operator: DoesNotExist
+      #        - key: k8s.ovn.org/dpu
+      #          operator: DoesNotExist
+      volumes:
+      # Common volumes
+      - name: host-var-run-dbus
+        hostPath:
+          path: /var/run/dbus
+      - name: host-kubelet
+        hostPath:
+          path: /var/lib/kubelet
+      - name: host-var-log-ovnkube
+        hostPath:
+          path: /var/log/ovn-kubernetes
+      - name: host-var-run-ovn-kubernetes
+        hostPath:
+          path: /var/run/ovn-kubernetes
+      - name: host-opt-cni-bin
+        hostPath:
+          path: /opt/cni/bin
+      - name: host-etc-cni-netd
+        hostPath:
+          path: /etc/cni/net.d
+      - name: host-slash
+        hostPath:
+          path: /
+      - name: host-netns
+        hostPath:
+          path: /var/run/netns
+      # non DPU related volumes
+      - name: host-var-log-ovs
+        hostPath:
+          path: /var/log/openvswitch
+      - name: host-run-ovs
+        hostPath:
+          path: /run/openvswitch
+      - name: host-var-run-ovs
+        hostPath:
+          path: /var/run/openvswitch
+      - name: host-ovn-cert
+        hostPath:
+          path: /etc/ovn
+          type: DirectoryOrCreate
+      - name: host-var-lib-ovs
+        hostPath:
+          path: /var/lib/openvswitch
+      - name: host-etc-ovs
+        hostPath:
+          path: /etc/openvswitch
+      - name: run-systemd
+        hostPath:
+          path: /run/systemd
+      tolerations:
+      - operator: "Exists"
+{{- end }}
